@@ -14,31 +14,6 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #
-# Need to load the scores, if they exist, and connect to irc, displaying
-# a welcome message.
-#
-# Scores should be kept in a class which will hold a nick -> score dict
-# object, and at the end of every question will dump the dict to json
-# where it can be loaded from. This might get weird if people start using
-# weird nicks, but we'll cross that road when we get to it.
-#
-# irc connection should be a class, and we should use twisted. We don't
-# really care if people come and go, since everyone in the channel is
-# playing. Should handle this like karma. Watch all traffic, and if
-# someone blurts out a string that matches the answer, they get the points.
-# If they haven't scored before, add them to the scoreboard and give them
-# their points, else, add their points to their total. Then dump the json.
-#
-# This bot requires there to be a ../questions/ directory with text files
-# in it. These files are named after there genres, so "80s Films.txt"
-# and the like. While the bot is running, it will randomly choose a
-# file from this directory, open it, randomly choose a line, which is
-# a question*answer pair, then load that into a structure to be asked.
-#
-# Once the question is loaded, the bot will ask the IRC channel the
-# question, wait a period of time, show a character, then ask the question
-# again.
-#
 # The bot should respond to /msgs, so that users can check their scores,
 # and admins can give admin commands, like die, show all scores, edit
 # player scores, etc. Commands should be easy to implement.
@@ -48,18 +23,34 @@
 #
 
 import json
-from os import listdir, path, makedirs
+import string
+import os
+import sys
+from os import execl, listdir, path, makedirs
 from random import choice
-
 from twisted.words.protocols import irc
 from twisted.internet import reactor
-from twisted.internet import ssl
 from twisted.internet.protocol import ClientFactory
 from twisted.internet.task import LoopingCall
 
 from lib.answer import Answer
 
 import config
+
+if not os.path.exists(config.SAVE_DIR):
+    os.makedirs(config.SAVE_DIR)
+
+if config.USE_SSL.lower() == "yes":
+    from twisted.internet import ssl
+elif config.USE_SSL.lower() != 'no':
+    # USE_SSL wasn't yes and it's not no, so raise an error.
+    raise ValueError("USE_SSL must either be 'yes' or 'no'.")
+
+# Determine text color
+try:
+    config.COLOR_CODE
+except:
+    config.COLOR_CODE = ''
 
 
 class triviabot(irc.IRCClient):
@@ -70,16 +61,20 @@ class triviabot(irc.IRCClient):
     implemented by a series of callbacks, initiated by an admin on the
     server.
     '''
+
     def __init__(self):
         self._answer = Answer()
         self._question = ''
         self._scores = {}
         self._clue_number = 0
         self._admins = list(config.ADMINS)
+        self._admins.append(config.OWNER)
         self._game_channel = config.GAME_CHANNEL
         self._current_points = 5
         self._questions_dir = config.Q_DIR
         self._lc = LoopingCall(self._play_game)
+        self._quit = False
+        self._restarting = False
         self._load_game()
         self._votes = 0
         self._voters = []
@@ -99,7 +94,7 @@ class triviabot(irc.IRCClient):
         Write a colorized message.
         """
 
-        self.msg(dest, "%s%s" % (config.COLOR_CODE, msg))
+        self.msg(dest, "{}{}".format(config.COLOR_CODE, msg))
 
     def _gmsg(self, msg):
         """
@@ -126,19 +121,19 @@ class triviabot(irc.IRCClient):
             self._gmsg("")
             self._gmsg("Next question:")
             self._gmsg(self._question)
-            self._gmsg("Clue: %s" % self._answer.current_clue())
+            self._gmsg("Clue: {}".format(self._answer.current_clue()))
             self._clue_number += 1
         # we must be somewhere in between
         elif self._clue_number < 4:
             self._current_points = points[self._clue_number]
             self._gmsg("Question:")
             self._gmsg(self._question)
-            self._gmsg('Clue: %s' % self._answer.give_clue())
+            self._gmsg("Clue: {}".format(self._answer.give_clue()))
             self._clue_number += 1
         # no one must have gotten it.
         else:
-            self._gmsg('No one got it. The answer was: %s' %
-                       self._answer.answer)
+            self._gmsg("No one got it. The answer was: {}"
+                       .format(self._answer.answer))
             self._clue_number = 0
             self._get_new_question()
             # self._lc.reset()
@@ -148,21 +143,21 @@ class triviabot(irc.IRCClient):
         Actions to perform on signon to the server.
         '''
         self.join(self._game_channel)
-        self.msg('NickServ', 'identify %s' % config.IDENT_STRING)
-        print("Signed on as %s." % (self.nickname,))
+        self.msg("NickServ", "identify {}".format(config.IDENT_STRING))
+        print("Signed on as {}.".format(self.nickname))
         if self.factory.running:
             self._start(None, None, None)
         else:
-            self._gmsg('Welcome to %s!' % self._game_channel)
+            self._gmsg("Welcome to {}!".format(self._game_channel))
             self._gmsg("Have an admin start the game when you are ready.")
             self._gmsg("For how to use this bot, just say ?help or")
-            self._gmsg("%s help." % self.nickname)
+            self._gmsg("{} help.".format(self.nickname))
 
     def joined(self, channel):
         '''
         Callback runs when the bot joins a channel
         '''
-        print("Joined %s." % (channel,))
+        print("Joined {}.".format((channel)))
 
     def privmsg(self, user, channel, msg):
         '''
@@ -170,13 +165,10 @@ class triviabot(irc.IRCClient):
         with it.
         '''
         user, temp = user.split('!')
-        print(user+" : "+channel+" : "+msg)
-        # need to strip off colors if present.
-        try:
-            while not msg[0].isalnum() and not msg[0] == '?':
-                msg = msg[1:]
-        except IndexError:
-            return
+        print(user + " : " + channel + " : " + msg)
+        # need to strip out non-printable characters if present.
+        printable = string.printable
+        msg = ''.join(filter(lambda x: x in printable, msg))
 
         # parses each incoming line, and sees if it's a command for the bot.
         try:
@@ -195,7 +187,8 @@ class triviabot(irc.IRCClient):
                 if msg.lower().strip() == self._answer.answer.lower():
                     self._winner(user, channel)
                     self._save_game()
-        except:
+        except Exception as e:
+            print(e)
             return
 
     def _winner(self, user, channel):
@@ -207,17 +200,18 @@ class triviabot(irc.IRCClient):
             self.msg(channel,
                      "I'm sorry, answers must be given in the game channel.")
             return
-        self._gmsg("%s GOT IT!" % user.upper())
+        self._gmsg("{} GOT IT!".format(user.upper()))
+        self._gmsg("""If there was any doubt, the correct answer was: {}""".format(self._answer.answer))
         try:
             self._scores[user] += self._current_points
         except:
             self._scores[user] = self._current_points
         if self._current_points == 1:
-            self._gmsg("%s point has been added to your score!" %
-                       str(self._current_points))
+            self._gmsg("{} point has been added to your score!"
+                       .format(str(self._current_points)))
         else:
-            self._gmsg("%s points have been added to your score!" %
-                       str(self._current_points))
+            self._gmsg("{} points have been added to your score!"
+                       .format(str(self._current_points)))
         self._clue_number = 0
         self._get_new_question()
 
@@ -226,7 +220,8 @@ class triviabot(irc.IRCClient):
         Responds to ctcp requests.
         Currently just reports them.
         '''
-        print("CTCP recieved: "+user+":"+channel+": "+msg[0][0]+" "+msg[0][1])
+        print("CTCP recieved: " + user + ":" + channel +
+              ": " + msg[0][0] + " " + msg[0][1])
 
     def _help(self, args, user, channel):
         '''
@@ -238,14 +233,14 @@ class triviabot(irc.IRCClient):
         try:
             self._admins.index(user)
         except:
-            self._cmsg(user, "I'm nameless's trivia bot.")
+            self._cmsg(user, "I'm {}'s trivia bot.".format(config.OWNER))
             self._cmsg(user, "Commands: score, standings, giveclue, help, "
                        "next, source")
             return
-        self._cmsg(user, "I'm nameless's trivia bot.")
+        self._cmsg(user, "I'm {}'s trivia bot.".format(config.OWNER))
         self._cmsg(user, "Commands: score, standings, giveclue, help, next, "
                    "skip, source")
-        self._cmsg("Admin commands: die, set <user> <score>, start, stop, "
+        self._cmsg(user, "Admin commands: die, set <user> <score>, start, stop, "
                    "save")
 
     def _show_source(self, args, user, channel):
@@ -274,6 +269,7 @@ class triviabot(irc.IRCClient):
                                   'skip': self._next_question
                                   }
         priviledged_commands = {'die': self._die,
+                                'restart': self._restart,
                                 'set': self._set_user_score,
                                 'start': self._start,
                                 'stop': self._stop,
@@ -288,16 +284,17 @@ class triviabot(irc.IRCClient):
 
         # the following takes care of sorting out functions and
         # priviledges.
-        if not is_admin and command in priviledged_commands.keys():
-            self.msg(channel, "%s: You don't tell me what to do." % user)
+        if not is_admin and command in priviledged_commands:
+            self.msg(channel, "{}: You don't tell me what to do."
+                     .format(user))
             return
-        elif is_admin and command in priviledged_commands.keys():
+        elif is_admin and command in priviledged_commands:
             priviledged_commands[command](args, user, channel)
-        elif command in unpriviledged_commands.keys():
+        elif command in unpriviledged_commands:
             unpriviledged_commands[command](args, user, channel)
         else:
-            self.describe(channel, '%slooks at %s oddly.' %
-                          (config.COLOR_CODE, user))
+            self.describe(channel, "{}looks at {} oddly."
+                          .format(config.COLOR_CODE, user))
 
     def _next_vote(self, args, user, channel):
         '''Implements user voting for the next question.
@@ -310,16 +307,16 @@ class triviabot(irc.IRCClient):
             return
         try:
             self._voters.index(user)
-            self._gmsg("You already voted, %s, give someone else a chance to "
-                       "hate this question" % user)
+            self._gmsg("You already voted, {}, give someone else a chance to "
+                       "hate this question".format(user))
             return
         except:
             if self._votes < 2:
                 self._votes += 1
                 self._voters.append(user)
                 print(self._voters)
-                self._gmsg("%s, you have voted. %s more votes needed to "
-                           "skip." % (user, str(3-self._votes)))
+                self._gmsg("{}, you have voted. {} more votes needed to "
+                           "skip.".format(user, str(3 - self._votes)))
             else:
                 self._votes = 0
                 self._voters = []
@@ -357,9 +354,7 @@ class triviabot(irc.IRCClient):
         '''
         Saves the game to the data directory.
         '''
-        if not path.exists(config.SAVE_DIR):
-            makedirs(config.SAVE_DIR)
-        with open(config.SAVE_DIR+'scores.json', 'w') as savefile:
+        with open(os.path.join(config.SAVE_DIR, 'scores.json'), 'w') as savefile:
             json.dump(self._scores, savefile)
             print("Scores have been saved.")
 
@@ -373,7 +368,7 @@ class triviabot(irc.IRCClient):
             print("Save directory doesn't exist.")
             return
         try:
-            with open(config.SAVE_DIR+'scores.json', 'r') as savefile:
+            with open(os.path.join(config.SAVE_DIR, 'scores.json'), 'r') as savefile:
                 temp_dict = json.load(savefile)
         except:
             print("Save file doesn't exist.")
@@ -390,27 +385,45 @@ class triviabot(irc.IRCClient):
         try:
             self._scores[args[0]] = int(args[1])
         except:
-            self._cmsg(user, args[0]+" not in scores database.")
+            self._cmsg(user, args[0] + " not in scores database.")
             return
-        self._cmsg(user, args[0]+" score set to "+args[1])
+        self._cmsg(user, args[0] + " score set to " + args[1])
 
     def _die(self, *args):
         '''
         Terminates execution of the bot.
-        Need to dig into twisted to figure out how this happens.
+        '''
+        self._quit = True
+        self.quit(message='This is triviabot, signing off.')
+
+    def _restart(self, *args):
+        '''
+        Restarts the bot
+        '''
+        self._restarting = True
+        print('Restarting')
+        self.quit(message='Triviabot restarting.')
+
+    def connectionLost(self, reason):
+        '''
+        Called when connection is lost
         '''
         global reactor
-        self.quit(message='This is triviabot, signing off.')
-        reactor.stop()
-        # figure out how to kill the bot
+        if self._restarting:
+            try:
+                execl(sys.executable, *([sys.executable]+sys.argv))
+            except Exception as e:
+                print("Failed to restart: {}".format(e))
+        if self._quit:
+            reactor.stop()
 
     def _score(self, args, user, channel):
         '''
         Tells the user their score.
         '''
         try:
-            self._cmsg(user, "Your current score is: %s" %
-                       str(self._scores[user]))
+            self._cmsg(user, "Your current score is: {}"
+                       .format(str(self._scores[user])))
         except:
             self._cmsg(user, "You aren't in my database.")
 
@@ -421,8 +434,7 @@ class triviabot(irc.IRCClient):
         if not self._lc.running:
             self._gmsg("We are not playing right now.")
             return
-        self._gmsg("Question has been skipped. The answer was: %s" %
-                   self._answer.answer)
+        self._gmsg("Question has been skipped. The answer was: {}".format(self._answer.answer))
         self._clue_number = 0
         self._lc.stop()
         self._lc.start(config.WAIT_INTERVAL)
@@ -434,11 +446,10 @@ class triviabot(irc.IRCClient):
         TODO: order them.
         '''
         self._cmsg(user, "The current trivia standings are: ")
-        sorted_scores = sorted(self._scores.iteritems(), key=lambda k, v:
-                               (v, k), reverse=True)
+        sorted_scores = sorted(self._scores.iteritems(), key=lambda (k, v): (v, k), reverse=True)
         for rank, (player, score) in enumerate(sorted_scores, start=1):
-            formatted_score = "%s: %s: %s" % (rank, player, score)
-            self._cmsg(user, str(formatted_score))
+            formatted_score = "{}: {}: {}".format(rank, player, score)
+            self._cmsg(user, formatted_score)
 
     def _give_clue(self, args, user, channel):
         if not self._lc.running:
@@ -446,7 +457,7 @@ class triviabot(irc.IRCClient):
             return
         self._cmsg(channel, "Question: ")
         self._cmsg(channel, self._question)
-        self._cmsg(channel, "Clue: "+self._answer.current_clue())
+        self._cmsg(channel, "Clue: " + self._answer.current_clue())
 
     def _get_new_question(self):
         '''
@@ -457,7 +468,7 @@ class triviabot(irc.IRCClient):
         while damaged_question:
             # randomly select file
             filename = choice(listdir(self._questions_dir))
-            fd = open(config.Q_DIR+filename)
+            fd = open(os.path.join(config.Q_DIR, filename))
             lines = fd.read().splitlines()
             myline = choice(lines)
             fd.close()
@@ -480,17 +491,21 @@ class ircbotFactory(ClientFactory):
         self.lineRate = config.LINE_RATE
 
     def clientConnectionLost(self, connector, reason):
-        print("Lost connection (%s)" % (reason,))
+        print("Lost connection ({})".format(reason))
         connector.connect()
 
     def clientConnectionFailed(self, connector, reason):
-        print("Could not connect: %s" % (reason,))
+        print("Could not connect: {}".format(reason))
         connector.connect()
 
 
 if __name__ == "__main__":
-    # these two lines do the irc connection over ssl.
-    reactor.connectSSL(config.SERVER, config.SERVER_PORT,
-                       ircbotFactory(), ssl.ClientContextFactory())
-    # reactor.connectTCP(config.SERVER, config.SERVER_PORT, ircbotFactory())
+    # SSL will be attempted in all cases unless "NO" is explicity specified
+    # in the config
+    if config.USE_SSL.lower() == "no":
+        reactor.connectTCP(config.SERVER, config.SERVER_PORT, ircbotFactory())
+    else:
+        reactor.connectSSL(config.SERVER, config.SERVER_PORT,
+                           ircbotFactory(), ssl.ClientContextFactory())
+
     reactor.run()
